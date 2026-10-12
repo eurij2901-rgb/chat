@@ -1,492 +1,480 @@
+require('dotenv').config();
 const express = require('express');
 const http = require('http');
 const { Server } = require('socket.io');
 const mongoose = require('mongoose');
-const cors = require('cors');
 const multer = require('multer');
 const path = require('path');
 const fs = require('fs');
-const session = require('express-session'); // ДОБАВЛЕНО: модуль сессий
+const crypto = require('crypto');
+const session = require('express-session');
+const bcrypt = require('bcryptjs');
+const nodemailer = require('nodemailer');
 
 const app = express();
 const server = http.createServer(app);
 const io = new Server(server);
 
-const nodemailer = require('nodemailer');
+// ---------- КОНФИГ (секреты только из .env) ----------
+const {
+    MONGO_URI,
+    SESSION_SECRET = crypto.randomBytes(32).toString('hex'),
+    SMTP_HOST = 'smtp.mail.ru',
+    SMTP_PORT = '465',
+    SMTP_USER,
+    SMTP_PASS,
+    PORT = 3000
+} = process.env;
 
-// --- НАСТРОЙКА СЕССИЙ ---
-app.use(session({
-    secret: 'my-super-secret-chat-key', // Секретный ключ для шифрования сессии
-    resave: false,
-    saveUninitialized: false,
-    cookie: { 
-        maxAge: 1000 * 60 * 60 * 24 * 30 // Сессия живет 30 дней
-    }
-}));
-
-app.use(express.static(__dirname));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
-app.use(cors());
-
-// --- 1. НАСТРОЙКА ФАЙЛОВ (MULTER) ---
-const uploadDir = path.join(__dirname, 'uploads');
-if (!fs.existsSync(uploadDir)) {
-    fs.mkdirSync(uploadDir);
+if (!MONGO_URI) {
+    console.error('❌ Не задан MONGO_URI в .env');
+    process.exit(1);
 }
 
-const storage = multer.diskStorage({
-    destination: (req, file, cb) => {
-        cb(null, 'uploads/');
-    },
-    filename: (req, file, cb) => {
-        const uniqueSuffix = Date.now() + '-' + Math.round(Math.random() * 1E9);
-        cb(null, uniqueSuffix + path.extname(file.originalname));
-    }
+// ---------- СЕССИИ ----------
+const sessionMiddleware = session({
+    secret: SESSION_SECRET,
+    resave: false,
+    saveUninitialized: false,
+    cookie: { maxAge: 1000 * 60 * 60 * 24 * 30, httpOnly: true, sameSite: 'lax' }
 });
-const upload = multer({ storage: storage });
-app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+app.use(sessionMiddleware);
+app.use(express.json({ limit: '1mb' }));
+app.use(express.urlencoded({ extended: true }));
 
-// --- 2. БАЗА ДАННЫХ ---
-mongoose.connect('mongodb+srv://eurij2901_db_user:S1dFJmbCBLCllTVE@cluster0.dqosu5r.mongodb.net/mychat?appName=Cluster0')
-    .then(() => console.log('✅ Успешное подключение к MongoDB Atlas!'))
-    .catch(err => console.error('❌ Ошибка подключения:', err));
+// Отдаём только index.html, а не весь каталог (иначе виден server.js и .env)
+app.get('/', (req, res) => res.sendFile(path.join(__dirname, 'index.html')));
 
-// --- СХЕМЫ ---
-const userSchema = new mongoose.Schema({
+// ---------- ФАЙЛЫ ----------
+const uploadDir = path.join(__dirname, 'uploads');
+if (!fs.existsSync(uploadDir)) fs.mkdirSync(uploadDir);
+
+const upload = multer({
+    storage: multer.diskStorage({
+        destination: (req, file, cb) => cb(null, uploadDir),
+        filename: (req, file, cb) => {
+            const suffix = Date.now() + '-' + crypto.randomBytes(6).toString('hex');
+            cb(null, suffix + path.extname(file.originalname).slice(0, 10));
+        }
+    }),
+    limits: { fileSize: 15 * 1024 * 1024 }
+});
+app.use('/uploads', express.static(uploadDir, {
+    setHeaders: (res) => res.setHeader('X-Content-Type-Options', 'nosniff')
+}));
+
+// ---------- БАЗА ----------
+mongoose.connect(MONGO_URI)
+    .then(() => console.log('✅ MongoDB подключена'))
+    .catch(err => console.error('❌ Ошибка MongoDB:', err));
+
+const User = mongoose.model('User', new mongoose.Schema({
     username: { type: String, required: true, unique: true },
     email: { type: String, required: true, unique: true },
     password: { type: String, required: true },
     avatar: { type: String, default: '👤' },
     theme: { type: String, default: 'light' },
     notifications: { type: Boolean, default: true },
-    contacts: [{ type: String }],       // ДОБАВЛЕНО для стабильности
-    blockedUsers: [{ type: String }]    // ДОБАВЛЕНО для стабильности
-});
-const User = mongoose.model('User', userSchema);
+    contacts: [String],
+    blockedUsers: [String],
+    lastSeen: { type: Date, default: Date.now }
+}));
 
-const RoomSchema = new mongoose.Schema({
+const Room = mongoose.model('Room', new mongoose.Schema({
     name: { type: String, required: true, unique: true },
     type: { type: String, default: 'private' },
     members: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
     creator: String
-});
-const Room = mongoose.model('Room', RoomSchema);
+}));
 
-const MessageSchema = new mongoose.Schema({
+const Message = mongoose.model('Message', new mongoose.Schema({
     user: String,
     text: String,
     fileUrl: String,
     fileName: String,
     fileType: String,
     time: String,
-    room: String,      
-    recipient: String, 
-    id: String,        
+    room: String,
+    recipient: String,
+    id: String,
+    edited: { type: Boolean, default: false },
     timestamp: { type: Date, default: Date.now }
-});
-const Message = mongoose.model('Message', MessageSchema);
+}));
 
-async function initPublicRooms() {
-    const publicRooms = ['General', 'Developers', 'Random'];
-    for (const name of publicRooms) {
-        const exists = await Room.findOne({ name });
-        if (!exists) {
+(async function initPublicRooms() {
+    for (const name of ['General', 'Developers', 'Random']) {
+        if (!(await Room.findOne({ name }))) {
             await new Room({ name, type: 'public', members: [] }).save();
-            console.log(`📢 Создана общая комната: ${name}`);
         }
     }
-}
-initPublicRooms(); // Вызываем создание комнат при старте
+})();
 
-// --- 3. МАРШРУТЫ ---
+// ---------- ПОЧТА ----------
+const transporter = SMTP_USER && SMTP_PASS
+    ? nodemailer.createTransport({
+        host: SMTP_HOST, port: Number(SMTP_PORT), secure: true,
+        auth: { user: SMTP_USER, pass: SMTP_PASS }
+    })
+    : null;
+
 const verificationCodes = new Map();
 
-const transporter = nodemailer.createTransport({
-    host: 'smtp.mail.ru', 
-    port: 465,                  
-    secure: true,               
-    auth: {
-        user: 'go.play.world@mail.ru',
-        pass: 'zQAkDxoYJXMtawwStt54' 
-    }
-});
+// Простой ограничитель частоты запросов
+const hits = new Map();
+function rateLimit(key, max, windowMs) {
+    const now = Date.now();
+    const arr = (hits.get(key) || []).filter(t => now - t < windowMs);
+    arr.push(now);
+    hits.set(key, arr);
+    return arr.length > max;
+}
 
-// Проверка сессии при перезагрузке страницы
+const publicUser = (u) => ({
+    username: u.username, email: u.email, avatar: u.avatar,
+    theme: u.theme, notifications: u.notifications
+});
+const clean = (s, max = 4000) => String(s ?? '').slice(0, max);
+const requireAuth = (req, res, next) =>
+    req.session?.username ? next() : res.status(401).json({ success: false, message: 'Не авторизован' });
+
+// ---------- МАРШРУТЫ ----------
 app.get('/check-session', (req, res) => {
-    if (req.session && req.session.username) {
-        res.json({ success: true, username: req.session.username });
-    } else {
-        res.json({ success: false });
-    }
+    res.json(req.session?.username
+        ? { success: true, username: req.session.username }
+        : { success: false });
 });
 
-// Выход из аккаунта
-app.post('/logout', (req, res) => {
-    req.session.destroy();
-    res.json({ success: true });
-});
+app.post('/logout', (req, res) => req.session.destroy(() => res.json({ success: true })));
 
 app.post('/send-code', async (req, res) => {
     try {
-        const { email } = req.body;
-        if (!email || !email.includes('@')) {
+        if (rateLimit('code:' + req.ip, 5, 10 * 60 * 1000))
+            return res.status(429).json({ success: false, message: 'Слишком много запросов, подождите.' });
+
+        const email = clean(req.body.email, 200).trim().toLowerCase();
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email))
             return res.status(400).json({ success: false, message: 'Введите корректный E-mail!' });
-        }
-
-        const existingUser = await User.findOne({ email });
-        if (existingUser) {
+        if (await User.findOne({ email }))
             return res.status(400).json({ success: false, message: 'Этот E-mail уже зарегистрирован!' });
-        }
+        if (!transporter)
+            return res.status(500).json({ success: false, message: 'Почта на сервере не настроена.' });
 
-        const code = Math.floor(100000 + Math.random() * 900000).toString();
-        verificationCodes.set(email, { code: code, expires: Date.now() + 300000 });
+        const code = crypto.randomInt(100000, 1000000).toString();
+        verificationCodes.set(email, { code, expires: Date.now() + 5 * 60 * 1000, tries: 0 });
 
         await transporter.sendMail({
-            from: '"Мой Мессенджер" go.play.world@mail.ru',
+            from: `"Мой Мессенджер" <${SMTP_USER}>`,
             to: email,
-            subject: 'Код подтверждения регистрации',
-            html: `<h3>Ваш код подтверждения: <b style="color: #00695c; font-size: 24px;">${code}</b></h3>
-                <p>Код действителен в течение 5 минут. Не передавайте его никому!</p>`
+            subject: 'Код подтверждения',
+            html: `<h3>Ваш код: <b style="color:#00695c;font-size:24px">${code}</b></h3>
+                   <p>Код действует 5 минут. Никому его не передавайте.</p>`
         });
-        res.json({ success: true, message: 'Код подтверждения отправлен на вашу почту!' });
-
-    } catch (error) {
-        console.error('Ошибка отправки письма:', error);
-        res.status(500).json({ success: false, message: 'Не удалось отправить письмо. Проверьте настройки почты!' });
+        res.json({ success: true, message: 'Код отправлен на почту!' });
+    } catch (e) {
+        console.error('Ошибка письма:', e);
+        res.status(500).json({ success: false, message: 'Не удалось отправить письмо.' });
     }
 });
 
 app.post('/register', async (req, res) => {
     try {
-        const { username, email, password, code } = req.body;
+        const username = clean(req.body.username, 30).trim();
+        const email = clean(req.body.email, 200).trim().toLowerCase();
+        const password = clean(req.body.password, 200);
+        const code = clean(req.body.code, 10).trim();
 
-        if (!username || !email || !password || !code) {
-            return res.status(400).json({ success: false, message: 'Заполните абсолютно все поля!' });
-        }
+        if (!username || !email || !password || !code)
+            return res.status(400).json({ success: false, message: 'Заполните все поля!' });
+        if (password.length < 6)
+            return res.status(400).json({ success: false, message: 'Пароль минимум 6 символов.' });
+        if (!/^[\p{L}\p{N}_.\-]{2,30}$/u.test(username))
+            return res.status(400).json({ success: false, message: 'Имя: 2–30 символов, буквы, цифры, _ . -' });
 
-        const savedData = verificationCodes.get(email);
-
-        if (!savedData) return res.status(400).json({ success: false, message: 'Сначала запросите код на почту!' });
-        if (Date.now() > savedData.expires) {
+        const saved = verificationCodes.get(email);
+        if (!saved) return res.status(400).json({ success: false, message: 'Сначала запросите код!' });
+        if (Date.now() > saved.expires) {
             verificationCodes.delete(email);
-            return res.status(400).json({ success: false, message: 'Время действия кода истекло! Запросите новый.' });
+            return res.status(400).json({ success: false, message: 'Код истёк, запросите новый.' });
         }
-        if (savedData.code !== code.trim()) return res.status(400).json({ success: false, message: 'Неверный код подтверждения!' });
+        if (++saved.tries > 5) {
+            verificationCodes.delete(email);
+            return res.status(400).json({ success: false, message: 'Слишком много попыток, запросите новый код.' });
+        }
+        if (saved.code !== code)
+            return res.status(400).json({ success: false, message: 'Неверный код!' });
 
-        const existingUser = await User.findOne({ $or: [{ username }, { email }] });
-        if (existingUser) return res.status(400).json({ success: false, message: 'Пользователь с таким именем или E-mail уже существует!' });
+        if (await User.findOne({ $or: [{ username }, { email }] }))
+            return res.status(400).json({ success: false, message: 'Имя или E-mail уже заняты!' });
 
-        await new User({ username, email, password }).save();
+        await new User({ username, email, password: await bcrypt.hash(password, 10) }).save();
         verificationCodes.delete(email);
-
         res.json({ success: true, message: 'Регистрация успешна!' });
     } catch (e) {
+        console.error(e);
         res.status(500).json({ success: false, message: 'Ошибка сервера' });
     }
 });
 
 app.post('/login', async (req, res) => {
     try {
-        const { username, password } = req.body;
-        const user = await User.findOne({ $or: [{ username: username }, { email: username }] });
-        
-        if (user && user.password === password) {
-            // СОХРАНЯЕМ СЕССИЮ
-            req.session.username = user.username; 
-            res.json({ success: true, message: 'Вход выполнен!', username: user.username });
-        } else {
-            res.status(401).json({ success: false, message: 'Неверные данные' });
-        }
-    } catch (e) { 
-        res.status(500).json({ success: false }); 
-    }
-});
+        if (rateLimit('login:' + req.ip, 10, 10 * 60 * 1000))
+            return res.status(429).json({ success: false, message: 'Слишком много попыток входа.' });
 
-app.post('/get-profile', async (req, res) => {
-    try {
-        const user = await User.findOne({ username: req.body.username });
-        if (user) res.json({ success: true, user });
-        else res.status(404).json({ success: false });
+        const login = clean(req.body.username, 200).trim();
+        const password = clean(req.body.password, 200);
+        const user = await User.findOne({ $or: [{ username: login }, { email: login.toLowerCase() }] });
+
+        let ok = false;
+        if (user) {
+            if (user.password.startsWith('$2')) {
+                ok = await bcrypt.compare(password, user.password);
+            } else if (user.password === password) {
+                // миграция старых аккаунтов с открытыми паролями
+                ok = true;
+                user.password = await bcrypt.hash(password, 10);
+                await user.save();
+            }
+        }
+        if (!ok) return res.status(401).json({ success: false, message: 'Неверные данные' });
+
+        req.session.username = user.username;
+        res.json({ success: true, username: user.username });
     } catch (e) {
         res.status(500).json({ success: false });
     }
 });
 
-app.post('/update-profile', async (req, res) => {
+app.post('/get-profile', requireAuth, async (req, res) => {
+    const user = await User.findOne({ username: req.session.username });
+    user ? res.json({ success: true, user: publicUser(user) }) : res.status(404).json({ success: false });
+});
+
+app.post('/update-profile', requireAuth, async (req, res) => {
     try {
-        const { currentUsername, newUsername, avatar, theme, notifications, newEmail, code } = req.body;
-        const user = await User.findOne({ username: currentUsername });
-        
+        const user = await User.findOne({ username: req.session.username });
         if (!user) return res.status(404).json({ success: false, message: 'Пользователь не найден' });
 
-        if (newEmail && newEmail !== 'undefined' && newEmail.trim() !== '' && newEmail !== user.email) {
-            const savedData = verificationCodes.get(newEmail);
-            if (!savedData || savedData.code !== (code ? code.trim() : '') || Date.now() > savedData.expires) {
-                return res.status(400).json({ success: false, message: 'Для смены почты нужен код из нового письма!' });
-            }
+        const newEmail = clean(req.body.newEmail, 200).trim().toLowerCase();
+        if (newEmail && newEmail !== user.email) {
+            const saved = verificationCodes.get(newEmail);
+            if (!saved || saved.code !== clean(req.body.code, 10).trim() || Date.now() > saved.expires)
+                return res.status(400).json({ success: false, message: 'Для смены почты нужен код из письма!' });
             user.email = newEmail;
             verificationCodes.delete(newEmail);
         }
 
-        if (newUsername && newUsername !== currentUsername) {
-            const existing = await User.findOne({ username: newUsername });
-            if (existing) return res.status(400).json({ success: false, message: 'Это имя уже занято!' });
+        const newUsername = clean(req.body.newUsername, 30).trim();
+        if (newUsername && newUsername !== user.username) {
+            if (!/^[\p{L}\p{N}_.\-]{2,30}$/u.test(newUsername))
+                return res.status(400).json({ success: false, message: 'Недопустимое имя.' });
+            if (await User.findOne({ username: newUsername }))
+                return res.status(400).json({ success: false, message: 'Это имя уже занято!' });
             user.username = newUsername;
-            // Обновляем имя в сессии
             req.session.username = newUsername;
         }
 
-        if (avatar) user.avatar = avatar;
-        if (theme) user.theme = theme;
-        user.notifications = notifications !== undefined ? notifications : user.notifications;
+        if (req.body.avatar) user.avatar = clean(req.body.avatar, 300);
+        if (['light', 'dark'].includes(req.body.theme)) user.theme = req.body.theme;
+        if (typeof req.body.notifications === 'boolean') user.notifications = req.body.notifications;
 
         await user.save();
-        res.json({ success: true, message: 'Настройки сохранены!', user });
+        res.json({ success: true, message: 'Настройки сохранены!', user: publicUser(user) });
     } catch (e) {
         res.status(500).json({ success: false, message: 'Ошибка сервера' });
     }
 });
 
-app.post('/upload', upload.single('file'), (req, res) => {
-    if (!req.file) return res.status(400).json({ success: false, message: 'Нет файла' });
-    const isImage = req.file.mimetype.startsWith('image/');
-    res.json({ 
-        success: true, 
-        fileUrl: '/uploads/' + req.file.filename,
-        fileName: req.file.originalname,
-        fileType: isImage ? 'image' : 'file'
+app.post('/upload', requireAuth, (req, res) => {
+    upload.single('file')(req, res, (err) => {
+        if (err) return res.status(400).json({ success: false, message: err.message });
+        if (!req.file) return res.status(400).json({ success: false, message: 'Нет файла' });
+        const isImage = /^image\/(png|jpe?g|gif|webp)$/.test(req.file.mimetype);
+        res.json({
+            success: true,
+            fileUrl: '/uploads/' + req.file.filename,
+            fileName: req.file.originalname,
+            fileType: isImage ? 'image' : 'file'
+        });
     });
 });
 
-// --- 4. SOCKET.IO И ФУНКЦИИ ---
-const users = {}; 
+// ---------- SOCKET.IO ----------
+io.use((socket, next) => sessionMiddleware(socket.request, {}, next));
+io.use((socket, next) => {
+    const name = socket.request.session?.username;
+    if (!name) return next(new Error('unauthorized'));
+    socket.username = name;
+    next();
+});
+
+const users = {}; // username -> Set<socket>
+const emitTo = (name, event, payload) => users[name]?.forEach(s => s.emit(event, payload));
+const timeNow = () => new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+const newId = () => crypto.randomBytes(8).toString('hex');
 
 async function sendUserList() {
-    const activeUsernames = Object.keys(users);
-    io.emit('update all active users', activeUsernames.map(name => ({ username: name })));
+    const online = Object.keys(users);
+    const docs = await User.find({}, 'username avatar contacts').lean();
+    const avatars = Object.fromEntries(docs.map(d => [d.username, d.avatar]));
+    io.emit('update all active users', online.map(n => ({ username: n, avatar: avatars[n] })));
 
-    for (const username of activeUsernames) {
-        if (!users[username]) continue;
-        
-        const userDoc = await User.findOne({ username });
-        if (!userDoc) continue;
-        
-        const userContacts = userDoc.contacts || [];
-        const onlineContacts = [];
-        const potentialContacts = [];
-
-        activeUsernames.forEach(onlineUser => {
-            if (onlineUser === username) return;
-            if (userContacts.includes(onlineUser)) {
-                onlineContacts.push({ username: onlineUser });
-            } else {
-                potentialContacts.push({ username: onlineUser });
-            }
-        });
-
-        users[username].emit('update online contacts', onlineContacts);
-        users[username].emit('update potential contacts', potentialContacts);
+    for (const d of docs) {
+        if (!users[d.username]) continue;
+        const contacts = (d.contacts || []).map(n => ({
+            username: n, avatar: avatars[n] || '👤', online: !!users[n]
+        }));
+        const potential = online
+            .filter(n => n !== d.username && !(d.contacts || []).includes(n))
+            .map(n => ({ username: n, avatar: avatars[n] }));
+        emitTo(d.username, 'update contacts', contacts);
+        emitTo(d.username, 'update potential contacts', potential);
     }
 }
 
 async function sendRoomList(username) {
-    const userSocket = users[username];
-    if (!userSocket) return;
-    
-    const currentUser = await User.findOne({ username });
-    if (!currentUser) return;
-
-    const rooms = await Room.find({
-        $or: [
-            { type: 'public' },
-            { members: currentUser._id } 
-        ]
-    }).populate('members', 'username'); 
-    
-    userSocket.emit('update room list', rooms);
+    if (!users[username]) return;
+    const me = await User.findOne({ username });
+    if (!me) return;
+    const rooms = await Room.find({ $or: [{ type: 'public' }, { members: me._id }] }, 'name type creator');
+    emitTo(username, 'update room list', rooms);
 }
 
-io.on('connection', (socket) => {
-    socket.on('set username', async (username) => {
-        socket.username = username;
-        users[username] = socket;
+async function canAccessRoom(username, roomName) {
+    const room = await Room.findOne({ name: roomName });
+    if (!room) return false;
+    if (room.type === 'public') return true;
+    const me = await User.findOne({ username }, '_id');
+    return !!me && room.members.some(m => m.equals(me._id));
+}
 
-        const userDoc = await User.findOne({ username });
-        if (userDoc) {
-            socket.emit('update contact list', userDoc.contacts);
-            socket.emit('update blocked list', userDoc.blockedUsers);
-        }
+io.on('connection', async (socket) => {
+    const me = socket.username;
+    (users[me] ||= new Set()).add(socket);
 
-        await sendRoomList(username);
-        sendUserList();
-    });
+    const doc = await User.findOne({ username: me });
+    if (doc) socket.emit('update blocked list', doc.blockedUsers || []);
+    await sendRoomList(me);
+    sendUserList();
 
     socket.on('search user by email', async (email) => {
-        try {
-            const user = await User.findOne({ email });
-            if (user) {
-                socket.emit('search result', { success: true, username: user.username, email: user.email });
-            } else {
-                socket.emit('search result', { success: false, message: 'Пользователь с такой почтой не найден' });
-            }
-        } catch (error) { console.error(error); }
+        const user = await User.findOne({ email: clean(email, 200).trim().toLowerCase() });
+        socket.emit('search result', user
+            ? { success: true, username: user.username }
+            : { success: false, message: 'Пользователь с такой почтой не найден' });
     });
 
     socket.on('create room', async (data) => {
         try {
-            const { name, memberNames, memberIds } = data;
-            const existing = await Room.findOne({ name });
-            if (existing) {
-                socket.emit('error message', 'Имя комнаты занято!');
-                return;
-            }
+            const name = clean(data.name, 40).trim();
+            if (!name) return socket.emit('error message', 'Введите название комнаты.');
+            if (await Room.findOne({ name })) return socket.emit('error message', 'Имя комнаты занято!');
 
-            const creatorDoc = await User.findOne({ username: socket.username });
-            if (!creatorDoc) return; 
+            const byName = await User.find({ username: { $in: data.memberNames || [] } }, '_id');
+            const ids = new Set(byName.map(d => d._id.toString()));
+            (data.memberIds || []).forEach(id => mongoose.isValidObjectId(id) && ids.add(id));
+            const creator = await User.findOne({ username: me }, '_id');
+            ids.add(creator._id.toString());
 
-            const memberDocsByName = await User.find({ username: { $in: memberNames } });
-            let finalIds = memberDocsByName.map(doc => doc._id.toString());
-
-            if (memberIds && memberIds.length > 0) {
-                memberIds.forEach(id => {
-                    if (!finalIds.includes(id)) finalIds.push(id);
-                });
-            }
-            
-            const creatorIdString = creatorDoc._id.toString();
-            if (!finalIds.includes(creatorIdString)) finalIds.push(creatorIdString);
-
-            const newRoom = new Room({
-                name,
-                type: 'private',
-                members: finalIds,
-                creator: socket.username
-            });
-            await newRoom.save();
-
-            const membersToNotify = await User.find({ _id: { $in: finalIds } });
-            membersToNotify.forEach(member => {
-                sendRoomList(member.username);
-            });
-
+            await new Room({ name, type: 'private', members: [...ids], creator: me }).save();
+            const members = await User.find({ _id: { $in: [...ids] } }, 'username');
+            members.forEach(m => sendRoomList(m.username));
         } catch (e) {
-            console.error(e);
-            socket.emit('error message', 'Ошибка при создании комнаты (проверьте ID).');
+            socket.emit('error message', 'Ошибка при создании комнаты.');
         }
     });
 
     socket.on('join room', async (roomName) => {
-        socket.leaveAll(); 
+        if (!(await canAccessRoom(me, roomName))) return socket.emit('error message', 'Нет доступа к комнате.');
+        [...socket.rooms].filter(r => r !== socket.id).forEach(r => socket.leave(r));
         socket.join(roomName);
-        socket.currentRoom = roomName;
-        
-        const history = await Message.find({ room: roomName }).sort({ timestamp: 1 }).limit(50);
-        socket.emit('load history', history);
+        const history = await Message.find({ room: roomName }).sort({ timestamp: -1 }).limit(100);
+        socket.emit('load history', history.reverse());
     });
 
     socket.on('join pm', async (recipient) => {
-        socket.currentRoom = null;
+        [...socket.rooms].filter(r => r !== socket.id).forEach(r => socket.leave(r));
         const history = await Message.find({
-            $or: [ { user: socket.username, recipient: recipient }, { user: recipient, recipient: socket.username } ],
-            room: null
-        }).sort({ timestamp: 1 }).limit(50);
-        socket.emit('load history', history);
+            room: null,
+            $or: [{ user: me, recipient }, { user: recipient, recipient: me }]
+        }).sort({ timestamp: -1 }).limit(100);
+        socket.emit('load history', history.reverse());
     });
 
-    socket.on('chat message', async (data) => {
-        const time = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-        const msgData = { 
-            user: socket.username, 
-            text: data.text || '', 
-            fileUrl: data.fileUrl,
-            fileName: data.fileName,
-            fileType: data.fileType,
-            room: data.room, 
-            time, 
-            id: Date.now().toString() 
+    function buildMsg(data) {
+        const text = clean(data.text);
+        const fileUrl = typeof data.fileUrl === 'string' && data.fileUrl.startsWith('/uploads/') ? data.fileUrl : undefined;
+        if (!text.trim() && !fileUrl) return null;
+        return {
+            user: me, text,
+            fileUrl,
+            fileName: fileUrl ? clean(data.fileName, 200) : undefined,
+            fileType: fileUrl ? (data.fileType === 'image' ? 'image' : 'file') : undefined,
+            time: timeNow(), id: newId()
         };
-        await new Message(msgData).save();
-        io.to(data.room).emit('chat message', msgData);
+    }
+
+    socket.on('chat message', async (data) => {
+        const room = clean(data.room, 80);
+        if (!(await canAccessRoom(me, room))) return;
+        const msg = buildMsg(data);
+        if (!msg) return;
+        msg.room = room;
+        await new Message(msg).save();
+        io.to(room).emit('chat message', msg);
     });
 
     socket.on('private message', async (data) => {
-        const senderDoc = await User.findOne({ username: socket.username });
-        const recipientDoc = await User.findOne({ username: data.recipient });
-        
-        if (recipientDoc && recipientDoc.blockedUsers && recipientDoc.blockedUsers.includes(socket.username)) {
-            return; 
+        const recipient = clean(data.recipient, 40);
+        const rDoc = await User.findOne({ username: recipient }, 'blockedUsers');
+        if (!rDoc) return;
+        if ((rDoc.blockedUsers || []).includes(me)) return;
+        const msg = buildMsg(data);
+        if (!msg) return;
+        msg.recipient = recipient;
+        msg.room = null;
+        await new Message(msg).save();
+        emitTo(me, 'chat message', msg);
+        if (recipient !== me) emitTo(recipient, 'chat message', msg);
+    });
+
+    socket.on('delete message', async ({ id }) => {
+        const msg = await Message.findOne({ id: clean(id, 40), user: me });
+        if (!msg) return;
+        await msg.deleteOne();
+        if (msg.room) io.to(msg.room).emit('message deleted', { id: msg.id });
+        else {
+            emitTo(me, 'message deleted', { id: msg.id });
+            emitTo(msg.recipient, 'message deleted', { id: msg.id });
         }
-        
-        const time = new Date().toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
-        const msgData = { 
-            user: socket.username, 
-            recipient: data.recipient, 
-            text: data.text || '', 
-            fileUrl: data.fileUrl,
-            fileName: data.fileName,
-            fileType: data.fileType,
-            room: null, 
-            time, 
-            id: data.id 
-        };
-        await new Message(msgData).save();
-        
-        socket.emit('chat message', msgData);
-        if (users[data.recipient]) users[data.recipient].emit('chat message', msgData);
     });
 
-    socket.on('add contact', async (contactName) => {
+    socket.on('typing', ({ room, recipient }) => {
+        if (room) socket.to(room).emit('typing', { user: me, room });
+        else if (recipient) emitTo(recipient, 'typing', { user: me, recipient });
+    });
+
+    const contactOp = (event, fn) => socket.on(event, async (name) => {
         try {
-            if (!socket.username || socket.username === contactName) return;
-            await User.updateOne({ username: socket.username }, { $addToSet: { contacts: contactName } });
-            const updatedUser = await User.findOne({ username: socket.username });
-            socket.emit('update contact list', updatedUser.contacts);
+            name = clean(name, 40);
+            if (!name || name === me) return;
+            await fn(name);
+            const d = await User.findOne({ username: me });
+            socket.emit('update blocked list', d.blockedUsers || []);
             sendUserList();
         } catch (e) { console.error(e); }
     });
-
-    socket.on('remove contact', async (contactName) => {
-        try {
-            if (!socket.username) return;
-            await User.updateOne({ username: socket.username }, { $pull: { contacts: contactName } });
-            socket.emit('error message', `Контакт ${contactName} удален.`);
-            sendUserList();
-        } catch (e) { console.error(e); }
-    });
-
-    socket.on('block user', async (blockedName) => {
-        try {
-            if (!socket.username) return;
-            await User.updateOne(
-                { username: socket.username },
-                { $addToSet: { blockedUsers: blockedName }, $pull: { contacts: blockedName } }
-            );
-            const updatedUser = await User.findOne({ username: socket.username });
-            socket.emit('update contact list', updatedUser.contacts);
-            socket.emit('update blocked list', updatedUser.blockedUsers); 
-            sendUserList();
-        } catch (e) { console.error(e); }
-    });
-
-    socket.on('unblock user', async (unblockedName) => {
-        try {
-            if (!socket.username) return;
-            await User.updateOne({ username: socket.username }, { $pull: { blockedUsers: unblockedName } });
-            const updatedUser = await User.findOne({ username: socket.username }); 
-            socket.emit('update blocked list', updatedUser.blockedUsers);
-            socket.emit('error message', `Пользователь ${unblockedName} разблокирован.`);
-            sendUserList();
-        } catch (e) { console.error(e); }
-    });
+    contactOp('add contact', n => User.updateOne({ username: me }, { $addToSet: { contacts: n } }));
+    contactOp('remove contact', n => User.updateOne({ username: me }, { $pull: { contacts: n } }));
+    contactOp('block user', n => User.updateOne({ username: me },
+        { $addToSet: { blockedUsers: n }, $pull: { contacts: n } }));
+    contactOp('unblock user', n => User.updateOne({ username: me }, { $pull: { blockedUsers: n } }));
 
     socket.on('disconnect', () => {
-        if (socket.username) {
-            delete users[socket.username];
-            sendUserList();
-        }
+        users[me]?.delete(socket);
+        if (!users[me]?.size) delete users[me];
+        User.updateOne({ username: me }, { lastSeen: new Date() }).catch(() => {});
+        sendUserList();
     });
 });
 
-const PORT = process.env.PORT || 3000;
-server.listen(PORT, () => console.log(`🚀 Сервер запущен на порту ${PORT}`));
+server.listen(PORT, () => console.log(`🚀 Сервер на порту ${PORT}`));
