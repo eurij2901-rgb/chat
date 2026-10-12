@@ -98,6 +98,8 @@ const Message = mongoose.model('Message', new mongoose.Schema({
     recipient: String,
     id: String,
     edited: { type: Boolean, default: false },
+    replyTo: { id: String, user: String, text: String },
+    reactions: { type: mongoose.Schema.Types.Mixed, default: {} }, // эмодзи -> [username]
     timestamp: { type: Date, default: Date.now }
 }));
 
@@ -289,11 +291,12 @@ app.post('/upload', requireAuth, (req, res) => {
         if (err) return res.status(400).json({ success: false, message: err.message });
         if (!req.file) return res.status(400).json({ success: false, message: 'Нет файла' });
         const isImage = /^image\/(png|jpe?g|gif|webp)$/.test(req.file.mimetype);
+        const isAudio = req.file.mimetype.startsWith('audio/');
         res.json({
             success: true,
             fileUrl: '/uploads/' + req.file.filename,
             fileName: req.file.originalname,
-            fileType: isImage ? 'image' : 'file'
+            fileType: isImage ? 'image' : isAudio ? 'audio' : 'file'
         });
     });
 });
@@ -400,23 +403,37 @@ io.on('connection', async (socket) => {
         socket.emit('load history', history.reverse());
     });
 
-    function buildMsg(data) {
+    async function buildMsg(data) {
         const text = clean(data.text);
         const fileUrl = typeof data.fileUrl === 'string' && data.fileUrl.startsWith('/uploads/') ? data.fileUrl : undefined;
         if (!text.trim() && !fileUrl) return null;
-        return {
+        const msg = {
             user: me, text,
             fileUrl,
             fileName: fileUrl ? clean(data.fileName, 200) : undefined,
-            fileType: fileUrl ? (data.fileType === 'image' ? 'image' : 'file') : undefined,
+            fileType: fileUrl ? (['image', 'audio'].includes(data.fileType) ? data.fileType : 'file') : undefined,
             time: timeNow(), id: newId()
         };
+        if (data.replyToId) {
+            const orig = await Message.findOne({ id: clean(data.replyToId, 40) });
+            if (orig) msg.replyTo = {
+                id: orig.id, user: orig.user,
+                text: (orig.text || (orig.fileType === 'audio' ? '🎤 Голосовое' : '📎 Файл')).slice(0, 120)
+            };
+        }
+        return msg;
+    }
+
+    // Доставка события всем, кто видит это сообщение
+    function broadcastFor(msg, event, payload) {
+        if (msg.room) io.to(msg.room).emit(event, payload);
+        else { emitTo(msg.user, event, payload); if (msg.recipient !== msg.user) emitTo(msg.recipient, event, payload); }
     }
 
     socket.on('chat message', async (data) => {
         const room = clean(data.room, 80);
         if (!(await canAccessRoom(me, room))) return;
-        const msg = buildMsg(data);
+        const msg = await buildMsg(data);
         if (!msg) return;
         msg.room = room;
         await new Message(msg).save();
@@ -428,7 +445,7 @@ io.on('connection', async (socket) => {
         const rDoc = await User.findOne({ username: recipient }, 'blockedUsers');
         if (!rDoc) return;
         if ((rDoc.blockedUsers || []).includes(me)) return;
-        const msg = buildMsg(data);
+        const msg = await buildMsg(data);
         if (!msg) return;
         msg.recipient = recipient;
         msg.room = null;
@@ -446,6 +463,33 @@ io.on('connection', async (socket) => {
             emitTo(me, 'message deleted', { id: msg.id });
             emitTo(msg.recipient, 'message deleted', { id: msg.id });
         }
+    });
+
+    socket.on('edit message', async ({ id, text }) => {
+        text = clean(text).trim();
+        if (!text) return;
+        const msg = await Message.findOne({ id: clean(id, 40), user: me });
+        if (!msg || msg.fileType === 'audio') return;
+        msg.text = text; msg.edited = true;
+        await msg.save();
+        broadcastFor(msg, 'message edited', { id: msg.id, text });
+    });
+
+    const REACTIONS = ['👍', '❤️', '😂', '😮', '😢', '🔥'];
+    socket.on('react', async ({ id, emoji }) => {
+        if (!REACTIONS.includes(emoji)) return;
+        const msg = await Message.findOne({ id: clean(id, 40) });
+        if (!msg) return;
+        // доступ: участник комнаты или одна из сторон личной переписки
+        if (msg.room ? !(await canAccessRoom(me, msg.room)) : ![msg.user, msg.recipient].includes(me)) return;
+        const r = msg.reactions || {};
+        const list = r[emoji] || [];
+        r[emoji] = list.includes(me) ? list.filter(u => u !== me) : [...list, me];
+        if (!r[emoji].length) delete r[emoji];
+        msg.reactions = r;
+        msg.markModified('reactions');
+        await msg.save();
+        broadcastFor(msg, 'reactions updated', { id: msg.id, reactions: r });
     });
 
     socket.on('typing', ({ room, recipient }) => {

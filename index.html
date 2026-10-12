@@ -97,6 +97,34 @@ ul.list li .label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-sp
 #emoji-pop button { background: none; border: none; font-size: 1.4em; border-radius: 6px; padding: 3px; }
 #emoji-pop button:hover { background: var(--panel2); }
 
+/* ---- Ответы, реакции, голос ---- */
+.quote { border-left: 3px solid var(--accent); background: rgba(0,0,0,.06); border-radius: 6px; padding: 3px 8px; margin-bottom: 4px;
+  font-size: .82em; cursor: pointer; }
+.quote b { color: var(--accent); display: block; }
+.quote span { color: var(--muted); display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; max-width: 260px; }
+.reactions { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 4px; }
+.reaction { border: 1px solid var(--border); background: var(--panel2); color: var(--text); border-radius: 12px; padding: 1px 7px; font-size: .8em; }
+.reaction.mine { border-color: var(--accent); background: rgba(0,168,132,.18); }
+.msg-tools { position: absolute; top: -14px; right: 6px; display: none; gap: 2px; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 8px; padding: 2px; box-shadow: 0 2px 8px rgba(0,0,0,.15); z-index: 2; }
+.message-item:hover .msg-tools { display: flex; }
+.msg-tools button { background: none; border: none; border-radius: 6px; padding: 2px 5px; font-size: .9em; }
+.msg-tools button:hover { background: var(--panel2); }
+.react-pick { display: none; position: absolute; top: 20px; right: 6px; background: var(--panel); border: 1px solid var(--border);
+  border-radius: 10px; padding: 3px; gap: 2px; z-index: 3; box-shadow: 0 4px 14px rgba(0,0,0,.2); }
+.react-pick.open { display: flex; }
+.react-pick button { background: none; border: none; font-size: 1.2em; border-radius: 6px; padding: 2px 4px; }
+.react-pick button:hover { background: var(--panel2); }
+.edited { font-style: italic; }
+audio { max-width: 240px; height: 36px; margin-top: 2px; display: block; }
+#ctx-bar { display: none; align-items: center; gap: 8px; padding: 6px 14px; background: var(--panel2); border-top: 1px solid var(--border); font-size: .85em; }
+#ctx-bar .txt { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border-left: 3px solid var(--accent); padding-left: 8px; }
+#mic-btn.rec { color: var(--danger); animation: pulse 1s infinite; }
+@keyframes pulse { 50% { opacity: .4; } }
+.message-item.flash { animation: flash 1.2s; }
+@keyframes flash { 0%, 60% { box-shadow: 0 0 0 3px var(--accent); } }
+@media (hover: none) { .msg-tools { display: flex; position: static; box-shadow: none; border: none; background: none; justify-content: flex-end; } }
+
 /* ---- Модалки ---- */
 .modal { display: none; position: fixed; inset: 0; background: rgba(0,0,0,.55); justify-content: center; align-items: center; z-index: 1000; padding: 16px; }
 .modal-content { background: var(--panel); padding: 22px; border-radius: 14px; width: 100%; max-width: 360px; max-height: 90vh; overflow-y: auto;
@@ -177,12 +205,17 @@ ul.list li .label { flex: 1; overflow: hidden; text-overflow: ellipsis; white-sp
     </div>
     <ul id="messages"><li class="placeholder">Выберите чат слева 💬</li></ul>
 
+    <div id="ctx-bar">
+      <div class="txt" id="ctx-text"></div>
+      <button type="button" class="icon-btn" onclick="clearContext()" title="Отмена">✕</button>
+    </div>
     <form id="form" onsubmit="event.preventDefault(); sendMessage();">
       <div id="emoji-pop"></div>
       <button type="button" class="icon-btn" id="emoji-btn" onclick="toggleEmoji()" title="Эмодзи">😊</button>
       <label for="file-input" id="file-label" title="Файл">📎</label>
       <input type="file" id="file-input" style="display:none">
       <input id="input" autocomplete="off" placeholder="Выберите чат…" disabled>
+      <button type="button" class="icon-btn" id="mic-btn" onclick="toggleRecording()" title="Голосовое сообщение" disabled>🎤</button>
       <button id="send-button" disabled title="Отправить">➤</button>
     </form>
   </div>
@@ -403,6 +436,18 @@ function connectSocket() {
 
   socket.on('message deleted', ({ id }) => document.querySelector(`[data-id="${CSS.escape(id)}"]`)?.remove());
 
+  socket.on('message edited', ({ id, text }) => {
+    const li = document.querySelector(`[data-id="${CSS.escape(id)}"]`);
+    if (!li) return;
+    li.querySelector('.body').textContent = text;
+    const meta = li.querySelector('.meta');
+    if (!meta.querySelector('.edited')) meta.prepend(el('span', { class: 'edited', text: 'изменено · ' }));
+  });
+  socket.on('reactions updated', ({ id, reactions }) => {
+    const li = document.querySelector(`[data-id="${CSS.escape(id)}"]`);
+    if (li) renderReactions(li, id, reactions);
+  });
+
   let typingTimer;
   socket.on('typing', (d) => {
     const here = (d.room && d.room === currentRoom) || (d.recipient && currentRecipient === d.user);
@@ -431,7 +476,8 @@ function renderBadges() {
 /* ---------- Чаты ---------- */
 function openChat(title) {
   messages.innerHTML = '';
-  input.disabled = false; $('send-button').disabled = false;
+  input.disabled = false; $('send-button').disabled = false; $('mic-btn').disabled = false;
+  clearContext();
   input.placeholder = 'Сообщение';
   $('chat-header').style.display = 'flex';
   $('chat-title').textContent = title; $('typing').textContent = '';
@@ -443,15 +489,31 @@ function joinRoom(name) { currentRoom = name; currentRecipient = null; openChat(
 function joinPM(name) { currentRecipient = name; currentRoom = null; openChat(name); socket.emit('join pm', name); }
 function leaveChat() { chatApp.classList.remove('in-chat'); }
 
+let replyTo = null, editingId = null;
+function setContext(label, text) {
+  $('ctx-text').textContent = '';
+  $('ctx-text').append(el('b', { text: label + ' ' }), (text || '').slice(0, 100));
+  $('ctx-bar').style.display = 'flex'; input.focus();
+}
+function clearContext() {
+  replyTo = null; editingId = null;
+  $('ctx-bar').style.display = 'none';
+}
+input.addEventListener('keydown', (e) => { if (e.key === 'Escape') { clearContext(); input.value = ''; } });
+
 function sendMessage() {
   const text = input.value.trim();
   if (!text) return;
-  emitMessage({ text });
+  if (editingId) socket.emit('edit message', { id: editingId, text });
+  else emitMessage({ text });
   input.value = '';
+  clearContext();
 }
 function emitMessage(extra) {
+  if (replyTo) extra = { ...extra, replyToId: replyTo.id };
   if (currentRoom) socket.emit('chat message', { ...extra, room: currentRoom });
   else if (currentRecipient) socket.emit('private message', { ...extra, recipient: currentRecipient });
+  clearContext();
 }
 let lastTyping = 0;
 input.addEventListener('input', () => {
@@ -467,16 +529,96 @@ function appendMessage(d) {
   const mine = d.user === myName;
   const li = el('li', { class: 'message-item' + (mine ? ' my-message' : ''), 'data-id': d.id || '' });
   if (!mine && d.room) li.append(el('div', { class: 'author', text: d.user }));
-  if (d.text) li.append(el('div', { class: 'body', text: d.text }));
+
+  if (d.replyTo && d.replyTo.id) {
+    li.append(el('div', {
+      class: 'quote',
+      onclick: () => {
+        const t = document.querySelector(`[data-id="${CSS.escape(d.replyTo.id)}"]`);
+        if (t) { t.scrollIntoView({ block: 'center', behavior: 'smooth' }); t.classList.remove('flash'); void t.offsetWidth; t.classList.add('flash'); }
+      }
+    }, el('b', { text: d.replyTo.user }), el('span', { text: d.replyTo.text })));
+  }
+
+  const body = el('div', { class: 'body', text: d.text || '' });
+  if (d.text) li.append(body);
   const url = safeUrl(d.fileUrl);
   if (url) {
     if (d.fileType === 'image') li.append(el('a', { href: url, target: '_blank', rel: 'noopener' }, el('img', { src: url, class: 'msg-image', alt: '' })));
+    else if (d.fileType === 'audio') li.append(el('audio', { src: url, controls: '', preload: 'metadata' }));
     else li.append(el('a', { href: url, download: d.fileName || 'file', text: '📄 ' + (d.fileName || 'файл') }));
   }
-  li.append(el('div', { class: 'meta', text: d.time || '' }));
-  if (mine && d.id) li.append(el('button', { class: 'msg-del', text: '🗑', title: 'Удалить', onclick: () => confirm('Удалить сообщение?') && socket.emit('delete message', { id: d.id }) }));
+
+  const meta = el('div', { class: 'meta', text: d.time || '' });
+  if (d.edited) meta.prepend(el('span', { class: 'edited', text: 'изменено · ' }));
+  li.append(meta);
+
+  if (d.id) {
+    const picker = el('div', { class: 'react-pick' },
+      REACTIONS.map(r => el('button', { type: 'button', text: r, onclick: () => { socket.emit('react', { id: d.id, emoji: r }); picker.classList.remove('open'); } })));
+    const tools = el('div', { class: 'msg-tools' },
+      el('button', { type: 'button', text: '😊', title: 'Реакция', onclick: (e) => { e.stopPropagation(); picker.classList.toggle('open'); } }),
+      el('button', { type: 'button', text: '↩', title: 'Ответить', onclick: () => {
+        replyTo = { id: d.id }; editingId = null;
+        setContext('Ответ ' + d.user + ':', d.text || (d.fileType === 'audio' ? '🎤 Голосовое' : '📎 Файл'));
+      } }),
+      (mine && d.fileType !== 'audio') ? el('button', { type: 'button', text: '✏️', title: 'Изменить', onclick: () => {
+        const cur = li.querySelector('.body')?.textContent ?? d.text ?? '';
+        editingId = d.id; replyTo = null; input.value = cur;
+        setContext('Изменение:', cur);
+      } }) : null,
+      mine ? el('button', { type: 'button', text: '🗑', title: 'Удалить', onclick: () => confirm('Удалить сообщение?') && socket.emit('delete message', { id: d.id }) }) : null
+    );
+    li.append(tools, picker);
+    renderReactions(li, d.id, d.reactions || {});
+  }
   messages.append(li);
   messages.scrollTop = messages.scrollHeight;
+}
+
+const REACTIONS = ['👍', '❤️', '😂', '😮', '😢', '🔥'];
+function renderReactions(li, id, reactions) {
+  li.querySelector('.reactions')?.remove();
+  const entries = Object.entries(reactions || {}).filter(([, users]) => users.length);
+  if (!entries.length) return;
+  const row = el('div', { class: 'reactions' }, entries.map(([emoji, users]) =>
+    el('button', {
+      type: 'button', class: 'reaction' + (users.includes(myName) ? ' mine' : ''),
+      title: users.join(', '), text: `${emoji} ${users.length}`,
+      onclick: () => socket.emit('react', { id, emoji })
+    })));
+  li.querySelector('.meta').before(row);
+}
+
+/* ---------- Голосовые сообщения ---------- */
+let recorder = null, chunks = [], recStream = null;
+async function toggleRecording() {
+  const btn = $('mic-btn');
+  if (recorder && recorder.state === 'recording') { recorder.stop(); return; }
+  if (!navigator.mediaDevices?.getUserMedia || !window.MediaRecorder)
+    return toast('Браузер не поддерживает запись (нужен https или localhost)');
+  try {
+    recStream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch { return toast('Нет доступа к микрофону'); }
+  chunks = [];
+  recorder = new MediaRecorder(recStream);
+  recorder.ondataavailable = (e) => e.data.size && chunks.push(e.data);
+  recorder.onstop = async () => {
+    btn.classList.remove('rec'); btn.textContent = '🎤';
+    recStream.getTracks().forEach(t => t.stop());
+    const blob = new Blob(chunks, { type: recorder.mimeType || 'audio/webm' });
+    if (blob.size < 1000) return toast('Слишком короткая запись');
+    const ext = blob.type.includes('mp4') ? 'm4a' : blob.type.includes('ogg') ? 'ogg' : 'webm';
+    const fd = new FormData(); fd.append('file', blob, `voice.${ext}`);
+    try {
+      const data = await (await fetch('/upload', { method: 'POST', body: fd })).json();
+      if (data.success) emitMessage({ fileUrl: data.fileUrl, fileName: data.fileName, fileType: 'audio' });
+      else toast(data.message || 'Не удалось отправить');
+    } catch { toast('Ошибка отправки голосового'); }
+  };
+  recorder.start();
+  btn.classList.add('rec'); btn.textContent = '⏹';
+  toast('Запись… нажмите ⏹, чтобы отправить');
 }
 
 /* ---------- Файлы и эмодзи ---------- */
